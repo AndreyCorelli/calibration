@@ -27,13 +27,18 @@ from utils.color_utils import rgb_to_lab, rgb_image_to_lab, delta_e_image
 def detect_paint_stroke(
     photo_bgr: np.ndarray,
     palette_bbox: tuple[int, int, int, int] | None = None,
+    n_bars: int = 1,
 ) -> tuple[tuple[int, int, int, int] | None, str | None]:
     """
     Detect the paint stroke region in the photo.
 
-    Searches to the right of the palette within its vertical extent.
+    Searches to the right of the palette, strictly within its vertical extent.
     Uses saturation-based detection: the stroke is a coloured blob surrounded
     by a low-saturation background (white paper or dark screen).
+
+    The stroke must:
+    - lie entirely within [palette_top, palette_bottom] vertically
+    - have a contour area no larger than one palette bar (palette_area / n_bars)
 
     Returns
     -------
@@ -44,13 +49,15 @@ def detect_paint_stroke(
 
     if palette_bbox is not None:
         px, py, pw, ph = palette_bbox
-        sx = max(0, px + pw)                      # start just right of palette
-        sy = max(0, py - ph // 2)
+        sx = max(0, px + pw)     # start just right of palette
+        sy = max(0, py)          # not above palette top
         sw = W_full - sx
-        sh = min(H_full - sy, py + ph - sy)       # end at palette bottom
+        sh = min(H_full - sy, ph)  # end exactly at palette bottom
+        bar_area = (pw * ph) / max(n_bars, 1)
     else:
         sx, sy = 0, 0
         sw, sh = W_full, H_full
+        bar_area = H_full * W_full * 0.45
 
     search = photo_bgr[sy : sy + sh, sx : sx + sw]
     SR_H, SR_W = search.shape[:2]
@@ -70,12 +77,11 @@ def detect_paint_stroke(
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     min_area = SR_H * SR_W * 0.003
-    max_area = SR_H * SR_W * 0.45
     candidates: list[tuple[float, int, int, int, int]] = []
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < min_area or area > max_area:
+        if area < min_area or area > bar_area:
             continue
         x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
         if w_c < 5 or h_c < 5:
@@ -91,13 +97,19 @@ def detect_paint_stroke(
     candidates.sort(key=lambda t: t[0], reverse=True)
     _, bx, by, bw, bh = candidates[0]
 
-    # Add margin so refine_stroke_region has background pixels at corners
+    # Add margin so refine_stroke_region has background pixels at corners,
+    # but keep the box within the palette's vertical band
     margin_x = bw // 4
     margin_y = bh // 4
     bx = max(0, bx - margin_x)
-    by = max(0, by - margin_y)
     bw = min(W_full - bx, bw + 2 * margin_x)
-    bh = min(H_full - by, bh + 2 * margin_y)
+    if palette_bbox is not None:
+        _py, _ph = palette_bbox[1], palette_bbox[3]
+        by = max(_py,        by - margin_y)
+        bh = min(_py + _ph - by, bh + 2 * margin_y)
+    else:
+        by = max(0, by - margin_y)
+        bh = min(H_full - by, bh + 2 * margin_y)
 
     return (bx, by, bw, bh), None
 

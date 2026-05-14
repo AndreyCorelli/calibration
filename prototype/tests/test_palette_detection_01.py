@@ -39,7 +39,7 @@ from calibration.palette_detector import (
 _TESTS_DIR   = os.path.dirname(__file__)
 _DATA        = os.path.join(_TESTS_DIR, "test_data", "test_01")
 PATTERN_PATH = os.path.join(_DATA, "pattern.png")
-PHOTO_PATH   = os.path.join(_DATA, "photo_sample.jpg")
+PHOTO_PATH   = os.path.join(_DATA, "photo_sample_1.jpg")
 OUTPUT_PATH  = os.path.join(_TESTS_DIR, "output", "debug_test_palette_detection_01.jpg")
 
 # ---------------------------------------------------------------------------

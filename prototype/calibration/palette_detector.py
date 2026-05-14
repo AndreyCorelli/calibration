@@ -3,6 +3,8 @@ Palette detection: extract digital colors from Im and locate the palette in a ph
 """
 from __future__ import annotations
 
+from itertools import combinations as _combinations
+
 import numpy as np
 import cv2
 from PIL import Image
@@ -143,6 +145,130 @@ def _shape_valid(
     return True
 
 
+def _detect_palette_by_shape(
+    photo_bgr: np.ndarray,
+    n_bars: int,
+    min_height_fraction: float = 0.35,
+) -> tuple[tuple[int, int, int, int] | None, list[tuple[int, int, int, int]]]:
+    """
+    Shape-based palette detection fallback.
+
+    Finds N square-shaped blobs with clear borders (Canny edges) that are
+    stacked vertically and together span at least min_height_fraction of the
+    image height.  Color-agnostic — works for printed palettes under any
+    lighting where the color-based approach fails.
+
+    Returns
+    -------
+    bbox      : combined (x, y, w, h) in original coordinates, or None
+    bar_bboxes: individual bar bboxes top→bottom (empty on failure)
+    """
+    H_orig, W_orig = photo_bgr.shape[:2]
+
+    # Work at a capped resolution for speed
+    detect_dim = 800
+    scale = min(1.0, detect_dim / max(H_orig, W_orig))
+    small = (
+        cv2.resize(photo_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        if scale < 1.0 else photo_bgr
+    )
+    H, W = small.shape[:2]
+
+    gray    = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges   = cv2.Canny(blurred, 20, 80)
+
+    # Close small gaps so square borders form closed loops
+    k3    = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges = cv2.dilate(edges, k3, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Per-bar size constraints
+    min_side = H * 0.08   # ≥ 8 % of image height
+    max_side = H * 0.65   # ≤ 65 % of image height (single bar)
+
+    seen: set[tuple[int, int, int, int]] = set()
+    candidates: list[tuple[int, int, int, int]] = []
+
+    for cnt in contours:
+        if cv2.contourArea(cnt) < min_side ** 2 * 0.3:
+            continue
+
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        if min(w, h) < min_side or max(w, h) > max_side:
+            continue
+
+        # Axis-aligned bounding-box squareness (tilted squares still look square)
+        if max(w, h) / max(min(w, h), 1) > 2.5:
+            continue
+
+        # Deduplicate by snapping to a 10 px grid
+        key = (round(x / 10) * 10, round(y / 10) * 10,
+               round(w / 10) * 10, round(h / 10) * 10)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        candidates.append((x, y, w, h))
+
+    # Keep only the 30 largest blobs to bound combination count
+    candidates.sort(key=lambda b: b[2] * b[3], reverse=True)
+    candidates = candidates[:30]
+
+    if len(candidates) < n_bars:
+        return None, []
+
+    min_combined_h                             = H * min_height_fraction
+    best_combo: list[tuple[int, int, int, int]] | None = None
+    best_score                                 = float("inf")
+
+    for combo in _combinations(candidates, n_bars):
+        bboxes = list(combo)
+
+        if not _shape_valid(
+            bboxes,
+            square_aspect_max=2.5,
+            x_center_tol_fraction=1.5,
+            y_gap_max_fraction=1.2,
+        ):
+            continue
+
+        ys_  = [b[1]        for b in bboxes]
+        y2s_ = [b[1] + b[3] for b in bboxes]
+        if max(y2s_) - min(ys_) < min_combined_h:
+            continue
+
+        # Prefer groups of uniformly-sized blobs
+        areas = [b[2] * b[3] for b in bboxes]
+        score = float(np.std(areas)) / (float(np.mean(areas)) + 1.0)
+
+        if score < best_score:
+            best_score = score
+            best_combo = sorted(bboxes, key=lambda b: b[1])
+
+    if best_combo is None:
+        return None, []
+
+    # Scale back to original resolution
+    inv = 1.0 / scale
+    best_combo = [
+        (int(b[0] * inv), int(b[1] * inv), int(b[2] * inv), int(b[3] * inv))
+        for b in best_combo
+    ]
+
+    xs_  = [b[0]        for b in best_combo]
+    ys_  = [b[1]        for b in best_combo]
+    x2s_ = [b[0] + b[2] for b in best_combo]
+    y2s_ = [b[1] + b[3] for b in best_combo]
+    bx, by = min(xs_), min(ys_)
+    bw = min(W_orig - bx, max(x2s_) - bx)
+    bh = min(H_orig - by, max(y2s_) - by)
+
+    return (bx, by, bw, bh), best_combo
+
+
 def detect_palette_in_photo(
     photo_bgr: np.ndarray,
     palette_colors_rgb: list[tuple[int, int, int]],
@@ -183,51 +309,49 @@ def detect_palette_in_photo(
     min_blob_area = H * W * min_blob_area_frac
     debug_combined = np.zeros((H, W), dtype=np.uint8)
     per_color_bboxes: list[tuple[int, int, int, int]] = []
+    color_ok = True
 
     for c_rgb in palette_colors_rgb:
-        c_lab  = rgb_to_lab(c_rgb)
-        de     = delta_e_image(photo_lab, c_lab)
-
-        # Adaptive threshold: ensure we always include pixels within de_adaptive_margin
-        # of the closest match, even when the colour is globally shifted by the camera.
+        c_lab    = rgb_to_lab(c_rgb)
+        de       = delta_e_image(photo_lab, c_lab)
         adaptive = max(de_threshold, float(de.min()) + de_adaptive_margin)
-        mask = (de < adaptive).astype(np.uint8) * 255
+        mask     = (de < adaptive).astype(np.uint8) * 255
         debug_combined = cv2.bitwise_or(debug_combined, mask)
 
         bbox = _largest_blob_bbox(mask, min_blob_area)
         if bbox is None:
-            debug_mask = (
-                cv2.resize(debug_combined, (W_orig, H_orig), interpolation=cv2.INTER_NEAREST)
-                if scale < 1.0 else debug_combined
-            )
-            return None, debug_mask
+            color_ok = False
+            break
         per_color_bboxes.append(bbox)
 
-    # Upscale debug mask
     debug_mask = (
         cv2.resize(debug_combined, (W_orig, H_orig), interpolation=cv2.INTER_NEAREST)
         if scale < 1.0 else debug_combined
     )
 
-    if not _shape_valid(per_color_bboxes):
-        return None, debug_mask
+    if color_ok and _shape_valid(per_color_bboxes):
+        xs  = [b[0]         for b in per_color_bboxes]
+        ys  = [b[1]         for b in per_color_bboxes]
+        x2s = [b[0] + b[2]  for b in per_color_bboxes]
+        y2s = [b[1] + b[3]  for b in per_color_bboxes]
+        bx, by = min(xs), min(ys)
+        bw, bh = max(x2s) - bx, max(y2s) - by
 
-    # Merge per-colour bboxes into one enclosing rectangle
-    xs  = [b[0]          for b in per_color_bboxes]
-    ys  = [b[1]          for b in per_color_bboxes]
-    x2s = [b[0] + b[2]  for b in per_color_bboxes]
-    y2s = [b[1] + b[3]  for b in per_color_bboxes]
-    bx, by = min(xs), min(ys)
-    bw, bh = max(x2s) - bx, max(y2s) - by
+        inv = 1.0 / scale
+        bx = max(0,           int(bx * inv))
+        by = max(0,           int(by * inv))
+        bw = min(W_orig - bx, int(bw * inv))
+        bh = min(H_orig - by, int(bh * inv))
+        return (bx, by, bw, bh), debug_mask
 
-    # Scale back to original resolution and clip
-    inv = 1.0 / scale
-    bx = max(0,          int(bx * inv))
-    by = max(0,          int(by * inv))
-    bw = min(W_orig - bx, int(bw * inv))
-    bh = min(H_orig - by, int(bh * inv))
+    # ── Shape-based fallback ────────────────────────────────────────────────
+    # Used when colour-based detection fails (e.g. printed palettes under
+    # ambient lighting where palette hues bleed into the background).
+    shape_bbox, _ = _detect_palette_by_shape(photo_bgr, len(palette_colors_rgb))
+    if shape_bbox is not None:
+        return shape_bbox, debug_mask
 
-    return (bx, by, bw, bh), debug_mask
+    return None, debug_mask
 
 
 def sample_palette_in_photo(

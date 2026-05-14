@@ -120,11 +120,8 @@ im_img = Image.open(im_file)
 # ---------------------------------------------------------------------------
 
 st.subheader("Uploaded images")
-col_pt, col_im = st.columns(2)
-with col_pt:
-    st.image(pt_img, caption="Target image (Pt)", use_container_width=True)
-with col_im:
-    st.image(im_img, caption="Calibration palette (Im)", use_container_width=True)
+st.image(pt_img, caption="Target image (Pt)", use_container_width=True)
+st.image(im_img, caption="Calibration palette (Im)", width=120)
 
 st.divider()
 
@@ -227,7 +224,7 @@ if run_btn:
 
     # 3e. Detect and refine paint stroke
     with st.spinner("Detecting paint stroke…"):
-        coarse_bbox, paint_err = detect_paint_stroke(photo_bgr, palette_bbox)
+        coarse_bbox, paint_err = detect_paint_stroke(photo_bgr, palette_bbox, n_bars=len(palette_colors))
 
     centroid = None
     stroke_bbox = None

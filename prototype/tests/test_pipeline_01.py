@@ -34,7 +34,7 @@ from calibration.palette_detector import (
     extract_palette_colors,
     sample_palette_in_photo,
 )
-from calibration.color_correction import apply_ccm, apply_inverse_ccm, estimate_ccm
+from calibration.color_correction import apply_ccm_idw, estimate_ccm
 from calibration.paint_detector import detect_paint_stroke, refine_stroke_region, sample_paint_color
 
 # ---------------------------------------------------------------------------
@@ -46,8 +46,11 @@ _DATA        = os.path.join(_TESTS_DIR, "test_data", "test_01")
 PATTERN_PATH = os.path.join(_DATA, "pattern.png")
 _OUTPUT_DIR  = os.path.join(_TESTS_DIR, "output")
 
-# Auto-discover all photo samples — sorted for stable parametrize IDs
-_PHOTO_PATHS = sorted(glob.glob(os.path.join(_DATA, "photo_sample*.jpg")))
+# Auto-discover all photo samples (.jpg and .jpeg) — sorted for stable parametrize IDs
+_PHOTO_PATHS = sorted(
+    glob.glob(os.path.join(_DATA, "photo_sample*.jpg")) +
+    glob.glob(os.path.join(_DATA, "photo_sample*.jpeg"))
+)
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +133,10 @@ def test_calibration_pipeline_01(photo_path: str) -> None:
 
     M = estimate_ccm(palette_colors, photo_colors)
     print(f"\n[Step 3] Colour correction matrix (3×4):\n{np.round(M, 4)}")
+    print(f"[Step 3] (IDW correction will be used for paint — matrix shown for reference)")
 
     # ── Step 4a: Coarse paint stroke detection ──────────────────────────────
-    coarse_bbox, paint_err = detect_paint_stroke(photo_bgr, palette_bbox)
+    coarse_bbox, paint_err = detect_paint_stroke(photo_bgr, palette_bbox, n_bars=len(palette_colors))
 
     if coarse_bbox is None:
         pytest.fail(
@@ -161,16 +165,13 @@ def test_calibration_pipeline_01(photo_path: str) -> None:
 
     # ── Step 5: Sample and colour-correct the paint stroke ──────────────────
     paint_photo_color   = sample_paint_color(photo_bgr, centroid, search_bbox=stroke_bbox)
-    paint_digital_color = apply_ccm(paint_photo_color, M)
-    paint_back_to_cam   = apply_inverse_ccm(paint_digital_color, M)
+    paint_digital_color = apply_ccm_idw(paint_photo_color, photo_colors, palette_colors)
 
     pr, pg, pb = paint_photo_color
     dr, dg, db = paint_digital_color
-    br, bg, bb = paint_back_to_cam
 
     print(f"\n[Step 5] Raw sample (9×9 seed + ΔE filter): R:{pr}, G:{pg}, B:{pb}")
     print(f"[Step 5] Corrected (digital equivalent):     R:{dr}, G:{dg}, B:{db}")
-    print(f"[Step 5] Back-converted to camera space:     R:{br}, G:{bg}, B:{bb}")
 
     # ── Debug image ──────────────────────────────────────────────────────────
     debug = photo_bgr.copy()
@@ -189,7 +190,7 @@ def test_calibration_pipeline_01(photo_path: str) -> None:
     cv2.drawMarker(debug, centroid, (255, 255, 255), cv2.MARKER_CROSS, 16, 1)
 
     SWATCH = 30
-    for i, color_rgb in enumerate([paint_back_to_cam, paint_digital_color, paint_photo_color]):
+    for i, color_rgb in enumerate([paint_digital_color, paint_photo_color]):
         y0, y1 = i * SWATCH, (i + 1) * SWATCH
         bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
         debug[y0:y1, 0:SWATCH] = bgr
