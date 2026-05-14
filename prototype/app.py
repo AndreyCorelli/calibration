@@ -230,7 +230,7 @@ if run_btn:
     stroke_bbox = None
     if coarse_bbox:
         with st.spinner("Refining stroke region…"):
-            stroke_bbox, centroid, _ = refine_stroke_region(
+            stroke_bbox, centroid, _, _ = refine_stroke_region(
                 photo_bgr, coarse_bbox, palette_bbox
             )
         st.session_state["paint_bbox"] = stroke_bbox
@@ -299,7 +299,7 @@ if "ccm" in st.session_state and "paint_color_digital" not in st.session_state:
     if st.button("Use this region"):
         M = st.session_state["ccm"]
         # Run refinement on the manually selected region too
-        stroke_bbox_man, centroid_man, _ = refine_stroke_region(
+        stroke_bbox_man, centroid_man, _, _ = refine_stroke_region(
             photo_bgr, paint_bbox_man, st.session_state.get("palette_bbox")
         )
         # Fall back to centre of the manual bbox if refinement fails

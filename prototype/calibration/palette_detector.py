@@ -14,6 +14,11 @@ from utils.color_utils import rgb_to_lab, rgb_image_to_lab, delta_e_image
 # Resize large photos to this dimension before running the color-search pass
 _DETECT_MAX_DIM = 900
 
+# Cell sizes (px at detection scale) to try when scanning for corner markers
+_MARKER_CELL_SIZES = (6, 8, 11, 15, 20, 27, 36)
+_MARKER_MATCH_THRESH   = 0.70  # per-detection minimum (keep real markers even if slightly degraded)
+_MARKER_MIN_PAIR_SUM   = 1.65  # sum of two match scores must exceed this; screen-UI noise tops ~1.56
+
 
 def extract_palette_colors(
     palette_pil: Image.Image,
@@ -269,6 +274,124 @@ def _detect_palette_by_shape(
     return (bx, by, bw, bh), best_combo
 
 
+def _make_marker_template(cell_px: int) -> np.ndarray:
+    """2×2 grid, top-left and bottom-right cells black, others white."""
+    s = cell_px
+    t = np.full((2 * s, 2 * s), 255, dtype=np.uint8)
+    t[:s, :s] = 0
+    t[s:, s:] = 0
+    return t
+
+
+def _detect_palette_by_markers(
+    photo_bgr: np.ndarray,
+) -> tuple[int, int, int, int] | None:
+    """
+    Locate the palette using two printed 2×2 diagonal corner markers.
+
+    The upper-left marker is placed at the upper-left corner of the printed
+    palette; the lower-right marker at the lower-right corner.  Each marker
+    is a 2×2 grid of equal squares with the top-left and bottom-right cells
+    filled black (the other two cells are white).
+
+    Detection runs template matching at several scales.  Two non-overlapping
+    detections are required; they must form a bounding box with a sane aspect
+    ratio and a minimum size relative to the image.
+
+    Returns (x, y, w, h) in original-image coordinates, or None.
+    """
+    H_orig, W_orig = photo_bgr.shape[:2]
+
+    scale = min(1.0, _DETECT_MAX_DIM / max(H_orig, W_orig))
+    gray_full = cv2.cvtColor(photo_bgr, cv2.COLOR_BGR2GRAY)
+    gray = (
+        cv2.resize(gray_full, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        if scale < 1.0 else gray_full
+    )
+    H, W = gray.shape
+
+    raw: list[tuple[float, int, int, int]] = []   # (score, x, y, cell_px)
+
+    for cell_px in _MARKER_CELL_SIZES:
+        tmpl = _make_marker_template(cell_px)
+        th, tw = tmpl.shape
+        if th >= H or tw >= W:
+            continue
+        res  = cv2.matchTemplate(gray, tmpl, cv2.TM_CCOEFF_NORMED)
+        rows, cols = np.where(res >= _MARKER_MATCH_THRESH)
+        for row, col in zip(rows.tolist(), cols.tolist()):
+            raw.append((float(res[row, col]), col, row, cell_px))
+
+    if not raw:
+        return None
+
+    # NMS: keep the highest-scoring non-overlapping detections
+    raw.sort(reverse=True)
+    kept: list[tuple[float, int, int, int]] = []
+    for score, x, y, cell_px in raw:
+        dup = False
+        for _, kx, ky, kc in kept:
+            ksz = max(kc, cell_px) * 2
+            if abs(x - kx) < ksz and abs(y - ky) < ksz:
+                dup = True
+                break
+        if not dup:
+            kept.append((score, x, y, cell_px))
+        if len(kept) >= 20:   # cap for efficiency; best pair wins by score
+            break
+
+    if len(kept) < 2:
+        return None
+
+    # Find the pair (m1=upper-left, m2=lower-right) with the best combined
+    # score whose implied palette passes basic geometry checks.
+    best_score = -1.0
+    best_bbox: tuple[int, int, int, int] | None = None
+
+    for i in range(len(kept)):
+        for j in range(i + 1, len(kept)):
+            s1, x1, y1, c1 = kept[i]
+            s2, x2, y2, c2 = kept[j]
+
+            # Ensure (x1, y1) is the upper-left candidate
+            if x1 + y1 > x2 + y2:
+                x1, y1, c1, s1, x2, y2, c2, s2 = x2, y2, c2, s2, x1, y1, c1, s1
+
+            # m2 must lie clearly below and to the right of m1
+            if x2 <= x1 + c1 or y2 <= y1 + c1:
+                continue
+
+            # Palette content = area between the markers' INNER corners:
+            #   upper-left inner corner  → (x1 + 2c1, y1 + 2c1)
+            #   lower-right inner corner → (x2,        y2       )
+            ix = x1 + 2 * c1
+            iy = y1 + 2 * c1
+            pw = x2 - ix
+            ph = y2 - iy
+
+            if pw < W * 0.05 or ph < H * 0.05:            # too small
+                continue
+            if max(pw, ph) / max(min(pw, ph), 1) > 10:    # wildly elongated
+                continue
+
+            pair_score = s1 + s2
+            if pair_score > best_score:
+                best_score = pair_score
+                best_bbox = (ix, iy, pw, ph)
+
+    # Reject if the winning pair doesn't clear the noise floor
+    if best_bbox is None or best_score < _MARKER_MIN_PAIR_SUM:
+        return None
+
+    inv = 1.0 / scale
+    bx, by, bw, bh = best_bbox
+    bx = max(0,           int(bx * inv))
+    by = max(0,           int(by * inv))
+    bw = min(W_orig - bx, int(bw * inv))
+    bh = min(H_orig - by, int(bh * inv))
+    return bx, by, bw, bh
+
+
 def detect_palette_in_photo(
     photo_bgr: np.ndarray,
     palette_colors_rgb: list[tuple[int, int, int]],
@@ -298,6 +421,13 @@ def detect_palette_in_photo(
     """
     H_orig, W_orig = photo_bgr.shape[:2]
 
+    # ── Strategy 1: corner markers ─────────────────────────────────────────
+    marker_bbox = _detect_palette_by_markers(photo_bgr)
+    if marker_bbox is not None:
+        empty_mask = np.zeros((H_orig, W_orig), dtype=np.uint8)
+        return marker_bbox, empty_mask
+
+    # ── Strategy 2: colour-based blob detection ────────────────────────────
     scale = min(1.0, _DETECT_MAX_DIM / max(H_orig, W_orig))
     small = (
         cv2.resize(photo_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -344,7 +474,7 @@ def detect_palette_in_photo(
         bh = min(H_orig - by, int(bh * inv))
         return (bx, by, bw, bh), debug_mask
 
-    # ── Shape-based fallback ────────────────────────────────────────────────
+    # ── Strategy 3: shape-based fallback ───────────────────────────────────
     # Used when colour-based detection fails (e.g. printed palettes under
     # ambient lighting where palette hues bleed into the background).
     shape_bbox, _ = _detect_palette_by_shape(photo_bgr, len(palette_colors_rgb))

@@ -99,6 +99,9 @@ def test_calibration_pipeline_01(photo_path: str) -> None:
     print(f"Photo: {os.path.basename(photo_path)}")
     print(f"{'='*60}")
 
+    # Accumulated failure messages — written to the debug image before failing.
+    failures: list[str] = []
+
     # ── Step 1: Extract digital palette colours from Im ─────────────────────
     palette_colors, bar_bounds = extract_palette_colors(im_pil)
 
@@ -114,83 +117,93 @@ def test_calibration_pipeline_01(photo_path: str) -> None:
     palette_bbox, _ = detect_palette_in_photo(photo_bgr, palette_colors)
 
     if palette_bbox is None:
-        pytest.fail(
-            "Step 2 failed — palette not detected in photo_sample.jpg.\n"
+        failures.append(
+            "Step 2 failed — palette not detected.\n"
             "Possible causes: poor lighting, palette not visible, colours too similar to background."
         )
-
-    x, y, w, h = palette_bbox
-    print(f"\n[Step 2] Palette location in photo: x:{x}, y:{y}, w:{w}, h:{h}")
+    else:
+        x, y, w, h = palette_bbox
+        print(f"\n[Step 2] Palette location in photo: x:{x}, y:{y}, w:{w}, h:{h}")
 
     # ── Step 3: Sample photographed colours and estimate CCM ────────────────
-    photo_colors = sample_palette_in_photo(photo_bgr, palette_bbox, len(palette_colors))
+    photo_colors: list = []
+    M = None
+    if palette_bbox is not None:
+        photo_colors = sample_palette_in_photo(photo_bgr, palette_bbox, len(palette_colors))
 
-    print(f"\n[Step 3] Colour comparison (digital vs photographed):")
-    for i, (dig, pho) in enumerate(zip(palette_colors, photo_colors)):
-        dr, dg, db = dig
-        pr, pg, pb = pho
-        print(f"  Bar {i + 1}  digital: R:{dr}, G:{dg}, B:{db}  |  photo: R:{pr}, G:{pg}, B:{pb}")
+        print(f"\n[Step 3] Colour comparison (digital vs photographed):")
+        for i, (dig, pho) in enumerate(zip(palette_colors, photo_colors)):
+            dr, dg, db = dig
+            pr, pg, pb = pho
+            print(f"  Bar {i + 1}  digital: R:{dr}, G:{dg}, B:{db}  |  photo: R:{pr}, G:{pg}, B:{pb}")
 
-    M = estimate_ccm(palette_colors, photo_colors)
-    print(f"\n[Step 3] Colour correction matrix (3×4):\n{np.round(M, 4)}")
-    print(f"[Step 3] (IDW correction will be used for paint — matrix shown for reference)")
+        M = estimate_ccm(palette_colors, photo_colors)
+        print(f"\n[Step 3] Colour correction matrix (3×4):\n{np.round(M, 4)}")
+        print(f"[Step 3] (IDW correction will be used for paint — matrix shown for reference)")
 
     # ── Step 4a: Coarse paint stroke detection ──────────────────────────────
-    coarse_bbox, paint_err = detect_paint_stroke(photo_bgr, palette_bbox, n_bars=len(palette_colors))
-
-    if coarse_bbox is None:
-        pytest.fail(
-            f"Step 4 failed — paint stroke not detected.\n"
-            f"Reason: {paint_err}"
+    coarse_bbox = None
+    if palette_bbox is not None:
+        coarse_bbox, paint_err = detect_paint_stroke(
+            photo_bgr, palette_bbox, n_bars=len(palette_colors)
         )
-
-    bx, by, bw, bh = coarse_bbox
-    print(f"\n[Step 4a] Coarse stroke bbox: x:{bx}, y:{by}, w:{bw}, h:{bh}")
+        if coarse_bbox is None:
+            failures.append(f"Step 4a failed — paint stroke not detected. Reason: {paint_err}")
+        else:
+            bx, by, bw, bh = coarse_bbox
+            print(f"\n[Step 4a] Coarse stroke bbox: x:{bx}, y:{by}, w:{bw}, h:{bh}")
 
     # ── Step 4b: Refine to actual stroke contour ─────────────────────────────
-    stroke_bbox, centroid, stroke_mask, clipped_bbox = refine_stroke_region(
-        photo_bgr, coarse_bbox, palette_bbox
-    )
-
-    if stroke_bbox is None or centroid is None:
-        pytest.fail(
-            "Step 4b failed — could not isolate the stroke from the background.\n"
-            "Check that the paint stroke contrasts with the paper."
+    stroke_bbox = centroid = stroke_mask = clipped_bbox = None
+    if coarse_bbox is not None:
+        stroke_bbox, centroid, stroke_mask, clipped_bbox = refine_stroke_region(
+            photo_bgr, coarse_bbox, palette_bbox
         )
-
-    sx, sy, stroke_w, stroke_h = stroke_bbox
-    cx, cy = centroid
-    print(f"[Step 4b] Refined stroke bbox: x:{sx}, y:{sy}, w:{stroke_w}, h:{stroke_h}")
-    print(f"[Step 4b] Stroke centroid:     x:{cx}, y:{cy}")
+        if stroke_bbox is None or centroid is None:
+            failures.append(
+                "Step 4b failed — could not isolate the stroke from the background.\n"
+                "Check that the paint stroke contrasts with the paper."
+            )
+        else:
+            sx, sy, stroke_w, stroke_h = stroke_bbox
+            cx, cy = centroid
+            print(f"[Step 4b] Refined stroke bbox: x:{sx}, y:{sy}, w:{stroke_w}, h:{stroke_h}")
+            print(f"[Step 4b] Stroke centroid:     x:{cx}, y:{cy}")
 
     # ── Step 5: Sample and colour-correct the paint stroke ──────────────────
-    paint_photo_color   = sample_paint_color(photo_bgr, centroid, search_bbox=stroke_bbox)
-    paint_digital_color = apply_ccm_idw(paint_photo_color, photo_colors, palette_colors)
+    paint_photo_color = paint_digital_color = None
+    if centroid is not None and photo_colors:
+        paint_photo_color   = sample_paint_color(photo_bgr, centroid, search_bbox=stroke_bbox)
+        paint_digital_color = apply_ccm_idw(paint_photo_color, photo_colors, palette_colors)
 
-    pr, pg, pb = paint_photo_color
-    dr, dg, db = paint_digital_color
+        pr, pg, pb = paint_photo_color
+        dr, dg, db = paint_digital_color
+        print(f"\n[Step 5] Raw sample (9×9 seed + ΔE filter): R:{pr}, G:{pg}, B:{pb}")
+        print(f"[Step 5] Corrected (digital equivalent):     R:{dr}, G:{dg}, B:{db}")
 
-    print(f"\n[Step 5] Raw sample (9×9 seed + ΔE filter): R:{pr}, G:{pg}, B:{pb}")
-    print(f"[Step 5] Corrected (digital equivalent):     R:{dr}, G:{dg}, B:{db}")
-
-    # ── Debug image ──────────────────────────────────────────────────────────
+    # ── Debug image (always written) ─────────────────────────────────────────
     debug = photo_bgr.copy()
 
-    mbx, mby, _, _ = clipped_bbox
-    mask_contours, _ = cv2.findContours(stroke_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in mask_contours:
-        cnt_global = cnt + np.array([[[mbx, mby]]])
-        cv2.drawContours(debug, [cnt_global], -1, (0, 200, 255), 1)
+    if stroke_mask is not None and clipped_bbox is not None:
+        mbx, mby, _, _ = clipped_bbox
+        mask_contours, _ = cv2.findContours(stroke_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in mask_contours:
+            cnt_global = cnt + np.array([[[mbx, mby]]])
+            cv2.drawContours(debug, [cnt_global], -1, (0, 200, 255), 1)
 
-    _draw_double_border(debug, palette_bbox)
-    _draw_double_border(debug, coarse_bbox)
-    _draw_double_border(debug, stroke_bbox, thickness=3)
-
-    cv2.drawMarker(debug, centroid, (0, 0, 0),      cv2.MARKER_CROSS, 20, 3)
-    cv2.drawMarker(debug, centroid, (255, 255, 255), cv2.MARKER_CROSS, 16, 1)
+    if palette_bbox is not None:
+        _draw_double_border(debug, palette_bbox)
+    if coarse_bbox is not None:
+        _draw_double_border(debug, coarse_bbox)
+    if stroke_bbox is not None:
+        _draw_double_border(debug, stroke_bbox, thickness=3)
+    if centroid is not None:
+        cv2.drawMarker(debug, centroid, (0, 0, 0),      cv2.MARKER_CROSS, 20, 3)
+        cv2.drawMarker(debug, centroid, (255, 255, 255), cv2.MARKER_CROSS, 16, 1)
 
     SWATCH = 30
-    for i, color_rgb in enumerate([paint_digital_color, paint_photo_color]):
+    swatches = [c for c in [paint_digital_color, paint_photo_color] if c is not None]
+    for i, color_rgb in enumerate(swatches):
         y0, y1 = i * SWATCH, (i + 1) * SWATCH
         bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
         debug[y0:y1, 0:SWATCH] = bgr
@@ -198,3 +211,6 @@ def test_calibration_pipeline_01(photo_path: str) -> None:
     os.makedirs(_OUTPUT_DIR, exist_ok=True)
     cv2.imwrite(output_path, debug)
     print(f"\n[Debug] Annotated image saved to: {output_path}")
+
+    if failures:
+        pytest.fail("\n".join(failures))
