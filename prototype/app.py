@@ -12,6 +12,7 @@ Workflow
 from __future__ import annotations
 
 import base64
+import glob
 import sys
 import os
 
@@ -28,10 +29,34 @@ from calibration.palette_detector import (
     extract_palette_colors,
     sample_palette_in_photo,
 )
-from calibration.color_correction import apply_ccm, estimate_ccm
+from calibration.color_correction import apply_ccm_idw, estimate_ccm
 from calibration.paint_detector import detect_paint_stroke, refine_stroke_region, sample_paint_color
 from calibration.color_matcher import find_matching_regions
 from ui.highlighter import create_blink_gif
+
+# ---------------------------------------------------------------------------
+# Runtime persistence
+# ---------------------------------------------------------------------------
+
+_RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "runtime")
+
+
+def _save_runtime(uploaded_file, prefix: str) -> None:
+    """Save *uploaded_file* to runtime/<prefix>.<ext>, removing any prior file for that prefix."""
+    os.makedirs(_RUNTIME_DIR, exist_ok=True)
+    for old in glob.glob(os.path.join(_RUNTIME_DIR, f"{prefix}.*")):
+        os.remove(old)
+    ext = os.path.splitext(uploaded_file.name)[1]
+    dest = os.path.join(_RUNTIME_DIR, f"{prefix}{ext}")
+    with open(dest, "wb") as fh:
+        fh.write(uploaded_file.getvalue())
+
+
+def _find_runtime(prefix: str) -> str | None:
+    """Return path to the saved runtime file for *prefix*, or None."""
+    matches = glob.glob(os.path.join(_RUNTIME_DIR, f"{prefix}.*"))
+    return matches[0] if matches else None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -85,10 +110,23 @@ with st.sidebar:
         "Target image (Pt)", type=["png", "jpg", "jpeg"],
         help="The image in which you want to find matching colour regions.",
     )
+    if pt_file:
+        _save_runtime(pt_file, "picture")
+    else:
+        _saved_pt = _find_runtime("picture")
+        if _saved_pt:
+            st.caption(f"Using saved: {os.path.basename(_saved_pt)}")
+
     im_file = st.file_uploader(
         "Calibration palette (Im)", type=["png"],
         help="The same PNG palette image you printed.",
     )
+    if im_file:
+        _save_runtime(im_file, "palette")
+    else:
+        _saved_im = _find_runtime("palette")
+        if _saved_im:
+            st.caption(f"Using saved: {os.path.basename(_saved_im)}")
 
     st.divider()
     st.header("Calibration photo")
@@ -108,12 +146,15 @@ with st.sidebar:
 # Guard: need both images before proceeding
 # ---------------------------------------------------------------------------
 
-if not pt_file or not im_file:
+_pt_source  = pt_file  or _find_runtime("picture")
+_im_source  = im_file  or _find_runtime("palette")
+
+if not _pt_source or not _im_source:
     st.info("Upload the target image (Pt) and calibration palette (Im) in the sidebar to begin.")
     st.stop()
 
-pt_img = Image.open(pt_file)
-im_img = Image.open(im_file)
+pt_img = Image.open(_pt_source)
+im_img = Image.open(_im_source)
 
 # ---------------------------------------------------------------------------
 # Step 1: Preview uploaded images
@@ -221,6 +262,8 @@ if run_btn:
         M = estimate_ccm(palette_colors, photo_colors)
 
     st.session_state["ccm"] = M
+    st.session_state["photo_colors"]    = photo_colors
+    st.session_state["palette_colors_"] = palette_colors  # preserve for IDW at result time
 
     # 3e. Detect and refine paint stroke
     with st.spinner("Detecting paint stroke…"):
@@ -263,9 +306,10 @@ if run_btn:
     if stroke_mask_app is not None and clipped_bbox_app is not None:
         with st.spinner("Sampling and correcting paint colour…"):
             paint_photo = sample_paint_color(photo_bgr, stroke_mask_app, clipped_bbox_app)
-            paint_digital = apply_ccm(paint_photo, M)
+            paint_digital = apply_ccm_idw(paint_photo, photo_colors, palette_colors)
 
         st.session_state["paint_color_digital"] = paint_digital
+        st.session_state["paint_photo"]         = paint_photo
 
         c1, c2 = st.columns(2)
         with c1:
@@ -311,8 +355,11 @@ if "ccm" in st.session_state and "paint_color_digital" not in st.session_state:
             clipped_man = (paint_x, paint_y, paint_w, paint_h)
             mask_man = np.ones((paint_h, paint_w), dtype=np.uint8) * 255
         paint_photo = sample_paint_color(photo_bgr, mask_man, clipped_man)
-        paint_digital = apply_ccm(paint_photo, M)
+        _pc = st.session_state.get("palette_colors_", [])
+        _ph = st.session_state.get("photo_colors",    [])
+        paint_digital = apply_ccm_idw(paint_photo, _ph, _pc) if _pc and _ph else paint_photo
         st.session_state["paint_color_digital"] = paint_digital
+        st.session_state["paint_photo"]         = paint_photo
         st.session_state["paint_bbox"] = stroke_bbox_man or paint_bbox_man
         st.rerun()
 
@@ -327,15 +374,38 @@ st.divider()
 st.subheader("Matching results")
 
 paint_digital: tuple = st.session_state["paint_color_digital"]
+paint_photo: tuple   = st.session_state.get("paint_photo", paint_digital)
+
+col_a, col_b = st.columns(2)
+with col_a:
+    st.markdown("**Photographed stroke**")
+    st.image(_swatch(paint_photo, (120, 60)), width=120)
+    st.caption(f"RGB {paint_photo}")
+with col_b:
+    st.markdown("**Digital equivalent (matched against Pt)**")
+    st.image(_swatch(paint_digital, (120, 60)), width=120)
+    st.caption(f"RGB {paint_digital}")
+
+# ΔE statistics: give the user a concrete anchor for the tolerance slider
+from calibration.color_matcher import find_matching_regions as _fmr
+from utils.color_utils import rgb_image_to_lab, rgb_to_lab, delta_e_image
+_target_lab  = rgb_image_to_lab(np.array(pt_img.convert("RGB"), dtype=np.uint8))
+_paint_lab   = rgb_to_lab(paint_digital)
+_de_flat     = delta_e_image(_target_lab, _paint_lab).ravel()
+_de_p5, _de_p25, _de_p50 = float(np.percentile(_de_flat, 5)), float(np.percentile(_de_flat, 25)), float(np.percentile(_de_flat, 50))
+st.caption(
+    f"ΔE in target — closest 5 % of pixels: ≤ {_de_p5:.1f} | "
+    f"closest 25 %: ≤ {_de_p25:.1f} | median: {_de_p50:.1f}"
+)
 
 tolerance = st.slider(
     "Tolerance (ΔE)",
-    min_value=1, max_value=60, value=20,
+    min_value=1, max_value=60, value=min(20, max(1, int(_de_p25))),
     help="Lower = stricter match.  Higher = broader match.",
 )
 
 with st.spinner("Searching target image…"):
-    mask = find_matching_regions(pt_img, paint_digital, tolerance=float(tolerance))
+    mask = _de_flat.reshape(_target_lab.shape[:2]) <= tolerance
 
 match_pct = 100.0 * mask.sum() / mask.size
 st.metric("Matched area", f"{match_pct:.1f}%")
@@ -345,6 +415,6 @@ with st.spinner("Building blink animation…"):
 
 st.markdown(_gif_html(gif_bytes), unsafe_allow_html=True)
 st.caption(
-    "**Blink animation** — alternates between the original image and the match mask "
-    "(white = matched colour, black = no match)."
+    "**Blink animation** — alternates between the original image and the same image "
+    "with matched regions highlighted in green."
 )

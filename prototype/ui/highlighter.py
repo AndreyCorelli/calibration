@@ -46,10 +46,14 @@ def create_blink_gif(
         )
         W, H = new_w, new_h
 
-    # Build the mask frame (white = match, black = no match)
-    mask_arr = np.zeros((H, W, 3), dtype=np.uint8)
-    mask_arr[mask] = [255, 255, 255]
-    mask_frame = Image.fromarray(mask_arr)
+    # Build the highlight frame: target image with matched pixels tinted bright green
+    img_arr = np.array(target_rgb, dtype=np.uint8)
+    highlight_arr = img_arr.copy()
+    if mask.any():
+        highlight_arr[mask] = (
+            img_arr[mask] * 0.35 + np.array([30, 220, 80], dtype=np.float32) * 0.65
+        ).clip(0, 255).astype(np.uint8)
+    mask_frame = Image.fromarray(highlight_arr)
 
     buf = io.BytesIO()
     target_rgb.save(
