@@ -228,9 +228,11 @@ if run_btn:
 
     centroid = None
     stroke_bbox = None
+    stroke_mask_app = None
+    clipped_bbox_app = None
     if coarse_bbox:
         with st.spinner("Refining stroke region…"):
-            stroke_bbox, centroid, _, _ = refine_stroke_region(
+            stroke_bbox, centroid, stroke_mask_app, clipped_bbox_app = refine_stroke_region(
                 photo_bgr, coarse_bbox, palette_bbox
             )
         st.session_state["paint_bbox"] = stroke_bbox
@@ -258,9 +260,9 @@ if run_btn:
         )
 
     # 3f. Sample & correct paint colour
-    if centroid:
+    if stroke_mask_app is not None and clipped_bbox_app is not None:
         with st.spinner("Sampling and correcting paint colour…"):
-            paint_photo = sample_paint_color(photo_bgr, centroid)
+            paint_photo = sample_paint_color(photo_bgr, stroke_mask_app, clipped_bbox_app)
             paint_digital = apply_ccm(paint_photo, M)
 
         st.session_state["paint_color_digital"] = paint_digital
@@ -299,13 +301,16 @@ if "ccm" in st.session_state and "paint_color_digital" not in st.session_state:
     if st.button("Use this region"):
         M = st.session_state["ccm"]
         # Run refinement on the manually selected region too
-        stroke_bbox_man, centroid_man, _, _ = refine_stroke_region(
+        stroke_bbox_man, centroid_man, mask_man, clipped_man = refine_stroke_region(
             photo_bgr, paint_bbox_man, st.session_state.get("palette_bbox")
         )
-        # Fall back to centre of the manual bbox if refinement fails
-        if centroid_man is None:
-            centroid_man = (paint_x + paint_w // 2, paint_y + paint_h // 2)
-        paint_photo = sample_paint_color(photo_bgr, centroid_man)
+        # Fall back: synthesise a full-region mask from the manual bbox
+        if mask_man is None or clipped_man is None:
+            cx = paint_x + paint_w // 2
+            cy = paint_y + paint_h // 2
+            clipped_man = (paint_x, paint_y, paint_w, paint_h)
+            mask_man = np.ones((paint_h, paint_w), dtype=np.uint8) * 255
+        paint_photo = sample_paint_color(photo_bgr, mask_man, clipped_man)
         paint_digital = apply_ccm(paint_photo, M)
         st.session_state["paint_color_digital"] = paint_digital
         st.session_state["paint_bbox"] = stroke_bbox_man or paint_bbox_man

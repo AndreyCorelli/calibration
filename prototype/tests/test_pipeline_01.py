@@ -172,8 +172,8 @@ def test_calibration_pipeline_01(photo_path: str) -> None:
 
     # ── Step 5: Sample and colour-correct the paint stroke ──────────────────
     paint_photo_color = paint_digital_color = None
-    if centroid is not None and photo_colors:
-        paint_photo_color   = sample_paint_color(photo_bgr, centroid, search_bbox=stroke_bbox)
+    if stroke_mask is not None and clipped_bbox is not None and photo_colors:
+        paint_photo_color   = sample_paint_color(photo_bgr, stroke_mask, clipped_bbox)
         paint_digital_color = apply_ccm_idw(paint_photo_color, photo_colors, palette_colors)
 
         pr, pg, pb = paint_photo_color
