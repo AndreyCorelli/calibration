@@ -3,8 +3,8 @@ Integration test — calibration pipeline, test case 01.
 
 Inputs
 ------
-test_data/test_01/pattern.png      → Im  (digital calibration palette)
-test_data/test_01/photo_sample.jpg → camera capture (printed palette + paint stroke)
+test_data/test_01/pattern.png           → Im  (digital calibration palette)
+test_data/test_01/photo_sample*.jpg     → camera captures (auto-discovered)
 
 The test walks the full pipeline in order:
   1. Extract digital palette colours from Im
@@ -16,11 +16,12 @@ The test walks the full pipeline in order:
 All intermediate values are printed to stdout for manual inspection.
 If a detection step fails the test stops and reports why — no automatic recovery.
 
-A debug image is written to tests/output/debug_test_pipeline_01.jpg showing
+A debug image is written to tests/output/debug_pipeline_<stem>.jpg showing
 detected bounding boxes as double-border outlines (black outer, white inner).
 """
 from __future__ import annotations
 
+import glob
 import os
 
 import cv2
@@ -43,8 +44,10 @@ from calibration.paint_detector import detect_paint_stroke, refine_stroke_region
 _TESTS_DIR   = os.path.dirname(__file__)
 _DATA        = os.path.join(_TESTS_DIR, "test_data", "test_01")
 PATTERN_PATH = os.path.join(_DATA, "pattern.png")
-PHOTO_PATH   = os.path.join(_DATA, "photo_sample.jpg")
-OUTPUT_PATH  = os.path.join(_TESTS_DIR, "output", "debug_test_pipeline_01.jpg")
+_OUTPUT_DIR  = os.path.join(_TESTS_DIR, "output")
+
+# Auto-discover all photo samples — sorted for stable parametrize IDs
+_PHOTO_PATHS = sorted(glob.glob(os.path.join(_DATA, "photo_sample*.jpg")))
 
 
 # ---------------------------------------------------------------------------
@@ -61,23 +64,13 @@ def _draw_double_border(
     bbox: tuple[int, int, int, int],
     thickness: int = 2,
 ) -> None:
-    """
-    Draw a high-contrast double border around *bbox* in-place.
-
-    Outer rectangle: black  (visible on light backgrounds)
-    Inner rectangle: white  (visible on dark backgrounds), inset by *thickness* px
-    """
     x, y, w, h = bbox
     H, W = img.shape[:2]
-
-    # Outer black rectangle
     pt1 = (max(0, x),          max(0, y))
     pt2 = (min(W - 1, x + w),  min(H - 1, y + h))
     cv2.rectangle(img, pt1, pt2, (0, 0, 0), thickness)
-
-    # Inner white rectangle, inset by thickness on every side
-    pt1_in = (min(W - 1, x + thickness),          min(H - 1, y + thickness))
-    pt2_in = (max(0,      x + w - thickness),      max(0,      y + h - thickness))
+    pt1_in = (min(W - 1, x + thickness),      min(H - 1, y + thickness))
+    pt2_in = (max(0,      x + w - thickness), max(0,      y + h - thickness))
     if pt1_in[0] < pt2_in[0] and pt1_in[1] < pt2_in[1]:
         cv2.rectangle(img, pt1_in, pt2_in, (255, 255, 255), thickness)
 
@@ -86,14 +79,22 @@ def _draw_double_border(
 # Test
 # ---------------------------------------------------------------------------
 
-def test_calibration_pipeline_01() -> None:
+@pytest.mark.parametrize("photo_path", _PHOTO_PATHS, ids=[os.path.splitext(os.path.basename(p))[0] for p in _PHOTO_PATHS])
+def test_calibration_pipeline_01(photo_path: str) -> None:
+    stem = os.path.splitext(os.path.basename(photo_path))[0]
+    output_path = os.path.join(_OUTPUT_DIR, f"debug_pipeline_{stem}.jpg")
+
     # ── Sanity-check inputs exist ───────────────────────────────────────────
     assert os.path.isfile(PATTERN_PATH), f"Missing fixture: {PATTERN_PATH}"
-    assert os.path.isfile(PHOTO_PATH),   f"Missing fixture: {PHOTO_PATH}"
+    assert os.path.isfile(photo_path),   f"Missing fixture: {photo_path}"
 
     im_pil    = Image.open(PATTERN_PATH)
-    photo_pil = Image.open(PHOTO_PATH)
+    photo_pil = Image.open(photo_path)
     photo_bgr = _pil_to_bgr(photo_pil)
+
+    print(f"\n{'='*60}")
+    print(f"Photo: {os.path.basename(photo_path)}")
+    print(f"{'='*60}")
 
     # ── Step 1: Extract digital palette colours from Im ─────────────────────
     palette_colors, bar_bounds = extract_palette_colors(im_pil)
@@ -135,7 +136,7 @@ def test_calibration_pipeline_01() -> None:
 
     if coarse_bbox is None:
         pytest.fail(
-            f"Step 4 failed — paint stroke not detected in photo_sample.jpg.\n"
+            f"Step 4 failed — paint stroke not detected.\n"
             f"Reason: {paint_err}"
         )
 
@@ -143,7 +144,7 @@ def test_calibration_pipeline_01() -> None:
     print(f"\n[Step 4a] Coarse stroke bbox: x:{bx}, y:{by}, w:{bw}, h:{bh}")
 
     # ── Step 4b: Refine to actual stroke contour ─────────────────────────────
-    stroke_bbox, centroid, stroke_mask = refine_stroke_region(
+    stroke_bbox, centroid, stroke_mask, clipped_bbox = refine_stroke_region(
         photo_bgr, coarse_bbox, palette_bbox
     )
 
@@ -153,9 +154,9 @@ def test_calibration_pipeline_01() -> None:
             "Check that the paint stroke contrasts with the paper."
         )
 
-    sx, sy, sw, sh = stroke_bbox
+    sx, sy, stroke_w, stroke_h = stroke_bbox
     cx, cy = centroid
-    print(f"[Step 4b] Refined stroke bbox: x:{sx}, y:{sy}, w:{sw}, h:{sh}")
+    print(f"[Step 4b] Refined stroke bbox: x:{sx}, y:{sy}, w:{stroke_w}, h:{stroke_h}")
     print(f"[Step 4b] Stroke centroid:     x:{cx}, y:{cy}")
 
     # ── Step 5: Sample and colour-correct the paint stroke ──────────────────
@@ -173,6 +174,13 @@ def test_calibration_pipeline_01() -> None:
 
     # ── Debug image ──────────────────────────────────────────────────────────
     debug = photo_bgr.copy()
+
+    mbx, mby, _, _ = clipped_bbox
+    mask_contours, _ = cv2.findContours(stroke_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in mask_contours:
+        cnt_global = cnt + np.array([[[mbx, mby]]])
+        cv2.drawContours(debug, [cnt_global], -1, (0, 200, 255), 1)
+
     _draw_double_border(debug, palette_bbox)
     _draw_double_border(debug, coarse_bbox)
     _draw_double_border(debug, stroke_bbox, thickness=3)
@@ -180,21 +188,12 @@ def test_calibration_pipeline_01() -> None:
     cv2.drawMarker(debug, centroid, (0, 0, 0),      cv2.MARKER_CROSS, 20, 3)
     cv2.drawMarker(debug, centroid, (255, 255, 255), cv2.MARKER_CROSS, 16, 1)
 
-    # Three 30×30 swatches stacked vertically at top-left
-    # Top:    digital colour back-converted to camera space
-    # Middle: corrected digital colour
-    # Bottom: raw sampled colour (what camera captured)
-    sw = 30  # swatch side length
-    swatches = [
-        (paint_back_to_cam, "cam-space"),
-        (paint_digital_color, "digital"),
-        (paint_photo_color,   "raw"),
-    ]
-    for i, (color_rgb, _) in enumerate(swatches):
-        y0, y1 = i * sw, (i + 1) * sw
+    SWATCH = 30
+    for i, color_rgb in enumerate([paint_back_to_cam, paint_digital_color, paint_photo_color]):
+        y0, y1 = i * SWATCH, (i + 1) * SWATCH
         bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
-        debug[y0:y1, 0:sw] = bgr
+        debug[y0:y1, 0:SWATCH] = bgr
 
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    cv2.imwrite(OUTPUT_PATH, debug)
-    print(f"\n[Debug] Annotated image saved to: {OUTPUT_PATH}")
+    os.makedirs(_OUTPUT_DIR, exist_ok=True)
+    cv2.imwrite(output_path, debug)
+    print(f"\n[Debug] Annotated image saved to: {output_path}")

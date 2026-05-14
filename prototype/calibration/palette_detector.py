@@ -129,14 +129,15 @@ def _shape_valid(
     if any(abs(xc - mean_xc) > x_center_tol_fraction * mean_w for xc in x_centers):
         return False
 
-    # Vertical stacking: no overlap, gap not too large
+    # Vertical stacking: gap must be within [-5px overlap, y_gap_max_fraction * mean_h]
     mean_h = float(np.mean([b[3] for b in sorted_boxes]))
     for i in range(len(sorted_boxes) - 1):
         _, y_a, _, h_a = sorted_boxes[i]
         _, y_b, _, _   = sorted_boxes[i + 1]
-        if y_b < y_a + h_a:          # overlap
+        gap = y_b - (y_a + h_a)
+        if gap < -5:                              # significant overlap → wrong blobs
             return False
-        if (y_b - (y_a + h_a)) > y_gap_max_fraction * mean_h:   # gap too large
+        if gap > y_gap_max_fraction * mean_h:     # gap too large
             return False
 
     return True

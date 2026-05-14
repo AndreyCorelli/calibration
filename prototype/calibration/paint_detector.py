@@ -21,7 +21,7 @@ from utils.color_utils import rgb_to_lab, rgb_image_to_lab, delta_e_image
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — coarse region detection (unchanged)
+# Stage 1 — coarse region detection
 # ---------------------------------------------------------------------------
 
 def detect_paint_stroke(
@@ -29,10 +29,11 @@ def detect_paint_stroke(
     palette_bbox: tuple[int, int, int, int] | None = None,
 ) -> tuple[tuple[int, int, int, int] | None, str | None]:
     """
-    Detect the pencil-bounded paint stroke region in the photo.
+    Detect the paint stroke region in the photo.
 
-    The search area is restricted to the right of the detected palette
-    at the vertical extent of the palette ±50%.
+    Searches to the right of the palette within its vertical extent.
+    Uses saturation-based detection: the stroke is a coloured blob surrounded
+    by a low-saturation background (white paper or dark screen).
 
     Returns
     -------
@@ -43,10 +44,10 @@ def detect_paint_stroke(
 
     if palette_bbox is not None:
         px, py, pw, ph = palette_bbox
-        sx = max(0, px + pw - pw // 8)
+        sx = max(0, px + pw)                      # start just right of palette
         sy = max(0, py - ph // 2)
         sw = W_full - sx
-        sh = min(H_full - sy, int(ph * 2.2))
+        sh = min(H_full - sy, py + ph - sy)       # end at palette bottom
     else:
         sx, sy = 0, 0
         sw, sh = W_full, H_full
@@ -57,12 +58,16 @@ def detect_paint_stroke(
     if SR_H < 10 or SR_W < 10:
         return None, "Search region too small"
 
-    gray    = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges   = cv2.Canny(blurred, 30, 100)
-    edges_d = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
+    # Saturation-based mask: paint is coloured (high S) and not too dark (high V)
+    hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
+    S, V = hsv[:, :, 1], hsv[:, :, 2]
+    mask = ((S > 40) & (V > 60)).astype(np.uint8) * 255
 
-    contours, _ = cv2.findContours(edges_d, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     min_area = SR_H * SR_W * 0.003
     max_area = SR_H * SR_W * 0.45
@@ -76,17 +81,24 @@ def detect_paint_stroke(
         if w_c < 5 or h_c < 5:
             continue
         aspect = max(w_c, h_c) / max(min(w_c, h_c), 1)
-        if aspect > 5:
+        if aspect > 5:          # reject thin browser chrome / toolbar strips
             continue
-        hull_area = cv2.contourArea(cv2.convexHull(cnt))
-        convexity = area / hull_area if hull_area > 0 else 0.0
-        candidates.append((area * convexity / aspect, x_c + sx, y_c + sy, w_c, h_c))
+        candidates.append((area, x_c + sx, y_c + sy, w_c, h_c))
 
     if not candidates:
         return None, "No paint stroke region detected"
 
     candidates.sort(key=lambda t: t[0], reverse=True)
     _, bx, by, bw, bh = candidates[0]
+
+    # Add margin so refine_stroke_region has background pixels at corners
+    margin_x = bw // 4
+    margin_y = bh // 4
+    bx = max(0, bx - margin_x)
+    by = max(0, by - margin_y)
+    bw = min(W_full - bx, bw + 2 * margin_x)
+    bh = min(H_full - by, bh + 2 * margin_y)
+
     return (bx, by, bw, bh), None
 
 
@@ -132,9 +144,10 @@ def refine_stroke_region(
 
     Returns
     -------
-    stroke_bbox : tight (x, y, w, h) around the stroke in full-photo coords, or None
-    centroid    : (cx, cy) centre of gravity of the stroke contour, or None
-    stroke_mask : uint8 binary mask inside the clipped region (for debug display)
+    stroke_bbox  : tight (x, y, w, h) around the stroke in full-photo coords, or None
+    centroid     : (cx, cy) centre of gravity of the stroke contour, or None
+    stroke_mask  : uint8 binary mask in the coordinate space of *clipped_bbox* (for display)
+    clipped_bbox : (x, y, w, h) — the palette-clipped coarse region the mask covers
     """
     photo_rgb = cv2.cvtColor(photo_bgr, cv2.COLOR_BGR2RGB)
     H_full, W_full = photo_rgb.shape[:2]
@@ -194,7 +207,9 @@ def refine_stroke_region(
         cx = bx + rx + rw // 2
         cy = by + ry + rh // 2
 
-    return stroke_bbox, (cx, cy), stroke_mask
+    # Return the clipped region bbox too so the caller can place the mask overlay correctly
+    clipped_bbox = (bx, by, bw, bh)
+    return stroke_bbox, (cx, cy), stroke_mask, clipped_bbox
 
 
 # ---------------------------------------------------------------------------
